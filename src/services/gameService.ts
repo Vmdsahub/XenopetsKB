@@ -29,6 +29,56 @@ export class GameService {
     }
   }
 
+  async removeItemFromInventory(userId: string, itemId: string, quantityToRemove = 1): Promise<boolean> {
+    try {
+      await validateGameAction('item_remove', { quantity: quantityToRemove });
+
+      // Find the unequipped item stack in the inventory
+      const { data: existingItem, error: fetchError } = await supabase
+        .from('inventory')
+        .select('id, quantity')
+        .eq('user_id', userId)
+        .eq('item_id', itemId)
+        .is('equipped_pet_id', null) // Ensure we are targeting an unequipped stack
+        .single();
+
+      if (fetchError && fetchError.code !== 'PGRST116') { // PGRST116: 'single' row not found
+        console.error('Error fetching item from inventory:', fetchError);
+        throw fetchError;
+      }
+
+      if (!existingItem) {
+        console.warn(`Item ${itemId} not found in user ${userId}'s unequipped inventory to remove.`);
+        return false; // Or throw an error, depending on desired behavior
+      }
+
+      const newQuantity = existingItem.quantity - quantityToRemove;
+
+      if (newQuantity > 0) {
+        // Update quantity
+        const { error: updateError } = await supabase
+          .from('inventory')
+          .update({ quantity: newQuantity, last_used: new Date().toISOString() })
+          .eq('id', existingItem.id);
+
+        if (updateError) throw updateError;
+      } else {
+        // Remove item entry
+        const { error: deleteError } = await supabase
+          .from('inventory')
+          .delete()
+          .eq('id', existingItem.id);
+
+        if (deleteError) throw deleteError;
+      }
+
+      return true;
+    } catch (error) {
+      console.error('Error removing item from inventory:', error);
+      return false;
+    }
+  }
+
   async createPet(petData: Omit<Pet, 'id' | 'createdAt' | 'updatedAt'>): Promise<Pet | null> {
     try {
       const { data, error } = await supabase
@@ -217,6 +267,59 @@ export class GameService {
       return false;
     }
   }
+
+  async equipItem(userId: string, petId: string, inventoryItemId: string, itemSlot: string): Promise<boolean> {
+    try {
+      await validateGameAction('item_equip', { petId, inventoryItemId, itemSlot });
+
+      // Start a transaction
+      const { data, error } = await supabase.rpc('equip_item_transaction', {
+        p_user_id: userId,
+        p_pet_id: petId,
+        p_inventory_item_id: inventoryItemId,
+        p_item_slot: itemSlot
+      });
+
+      if (error) throw error;
+      return data;
+
+    } catch (error) {
+      console.error('Error equipping item:', error);
+      // Check if it's a specific error from the RPC function (e.g., 'Item not found or already equipped')
+      if (error.message && error.message.includes("Item not found") ) {
+         // Potentially throw a custom error or return a specific response
+         throw new Error("Item not found in inventory or does not have quantity 1.");
+      }
+      if (error.message && error.message.includes("Slot conflict") ) {
+        throw new Error("Another item is already equipped in this slot by this pet.");
+      }
+      return false;
+    }
+  }
+
+  async unequipItem(userId: string, petId: string, inventoryItemId: string, itemSlot: string): Promise<boolean> {
+    try {
+      await validateGameAction('item_unequip', { petId, inventoryItemId, itemSlot });
+
+      const { data, error } = await supabase.rpc('unequip_item_transaction', {
+        p_user_id: userId,
+        p_pet_id: petId,
+        p_inventory_item_id: inventoryItemId,
+        p_item_slot: itemSlot
+      });
+
+      if (error) throw error;
+      return data;
+
+    } catch (error) {
+      console.error('Error unequipping item:', error);
+      if (error.message && error.message.includes("Item not equipped by this pet") ) {
+        throw new Error("Item not found or not equipped by this pet in the specified slot.");
+     }
+      return false;
+    }
+  }
+
 
   // Player search operations
   async searchPlayers(query: string): Promise<User[]> {
