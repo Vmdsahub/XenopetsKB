@@ -319,21 +319,37 @@ export const useGameStore = create<GameStore>()(
         });
       },
       
-      removeFromInventory: (itemId, quantity = 1) => set((state) => ({
-        inventory: state.inventory.reduce((acc, item) => {
-          if (item.id === itemId) {
-            const newQuantity = item.quantity - quantity;
-            if (newQuantity > 0) {
-              acc.push({ ...item, quantity: newQuantity });
-            }
+      removeFromInventory: async (itemId, quantityToRemove = 1) => {
+        const state = get();
+        if (!state.user) return;
+
+        try {
+          const success = await gameService.removeItemFromInventory(state.user.id, itemId, quantityToRemove);
+          if (success) {
+            set((currentState) => ({
+              inventory: currentState.inventory.reduce((acc, item) => {
+                if (item.id === itemId) {
+                  const newQuantity = item.quantity - quantityToRemove;
+                  if (newQuantity > 0) {
+                    acc.push({ ...item, quantity: newQuantity });
+                  }
+                } else {
+                  acc.push(item);
+                }
+                return acc;
+              }, [] as Item[])
+            }));
           } else {
-            acc.push(item);
+            // Potentially notify user of failure if desired
+            console.warn(`Failed to remove item ${itemId} from database.`);
           }
-          return acc;
-        }, [] as Item[])
-      })),
+        } catch (error) {
+          console.error('Error removing item from inventory store:', error);
+          // Potentially notify user
+        }
+      },
       
-      useItem: (itemId, petId) => {
+      useItem: async (itemId, petId) => { // Made async to align with potential async operations
         const state = get();
         const item = state.inventory.find(i => i.id === itemId) || get().getUniversalItem(itemId);
         const pet = state.pets.find(p => p.id === petId);
@@ -369,12 +385,71 @@ export const useGameStore = create<GameStore>()(
         });
       },
       
-      equipItem: (itemId, petId) => {
-        console.log(`Equipping item ${itemId} on pet ${petId}`);
+      equipItem: async (inventoryItemId, petId) => {
+        const state = get();
+        if (!state.user || !state.activePet || state.activePet.id !== petId) {
+          console.error("User or active pet not available for equipping.");
+          return;
+        }
+
+        const itemToEquip = state.inventory.find(invItem => invItem.id === inventoryItemId);
+        if (!itemToEquip || !itemToEquip.slot) {
+          console.error("Item not found in inventory or item has no slot.");
+          get().addNotification({ type: 'error', title: 'Erro ao Equipar', message: 'Item inválido ou não pode ser equipado.' });
+          return;
+        }
+
+        try {
+          const success = await gameService.equipItem(state.user.id, petId, inventoryItemId, itemToEquip.slot);
+          if (success) {
+            // Reload all user data to ensure consistency as equipment can affect many things
+            // and RPC function handles complex state changes.
+            await get().loadUserData(state.user.id);
+            get().addNotification({
+              type: 'success',
+              title: 'Item Equipado',
+              message: `${itemToEquip.name} equipado em ${state.activePet.name}!`
+            });
+          } else {
+            get().addNotification({ type: 'error', title: 'Falha ao Equipar', message: 'Não foi possível equipar o item.' });
+          }
+        } catch (error: any) {
+          console.error('Error equipping item in store:', error);
+          get().addNotification({ type: 'error', title: 'Erro ao Equipar', message: error.message || 'Ocorreu um erro inesperado.' });
+        }
       },
       
-      unequipItem: (slot, petId) => {
-        console.log(`Unequipping ${slot} from pet ${petId}`);
+      unequipItem: async (inventoryItemId, petId) => { // Changed signature to use inventoryItemId
+        const state = get();
+        if (!state.user || !state.activePet || state.activePet.id !== petId) {
+          console.error("User or active pet not available for unequipping.");
+          return;
+        }
+
+        const itemToUnequip = state.inventory.find(invItem => invItem.id === inventoryItemId && invItem.isEquipped && invItem.equippedPetId === petId);
+        if (!itemToUnequip || !itemToUnequip.slot) {
+          console.error("Item not found in pet's equipment or item has no slot.");
+          get().addNotification({ type: 'error', title: 'Erro ao Desequipar', message: 'Item inválido ou não está equipado.' });
+          return;
+        }
+
+        try {
+          const success = await gameService.unequipItem(state.user.id, petId, inventoryItemId, itemToUnequip.slot);
+          if (success) {
+            // Reload all user data for consistency
+            await get().loadUserData(state.user.id);
+            get().addNotification({
+              type: 'success',
+              title: 'Item Desequipado',
+              message: `${itemToUnequip.name} desequipado de ${state.activePet.name}.`
+            });
+          } else {
+            get().addNotification({ type: 'error', title: 'Falha ao Desequipar', message: 'Não foi possível desequipar o item.' });
+          }
+        } catch (error: any) {
+          console.error('Error unequipping item in store:', error);
+          get().addNotification({ type: 'error', title: 'Erro ao Desequipar', message: error.message || 'Ocorreu um erro inesperado.' });
+        }
       },
       
       updatePetStats: async (petId, stats) => {
@@ -564,14 +639,25 @@ export const useGameStore = create<GameStore>()(
       partialize: (state) => ({
         user: state.user,
         language: state.language,
-        currentScreen: state.currentScreen
+        currentScreen: state.currentScreen,
+        // Persist core game data
+        pets: state.pets,
+        activePet: state.activePet,
+        inventory: state.inventory,
+        xenocoins: state.xenocoins,
+        cash: state.cash,
+        notifications: state.notifications.slice(0, 20), // Limit notifications to avoid large storage
+        achievements: state.achievements,
+        collectibles: state.collectibles,
+        quests: state.quests
       }),
       onRehydrateStorage: () => (state) => {
         if (state) {
-          // Rehydrate all date fields in the state
-          if (state.user) {
-            state.user = rehydrateDates(state.user);
-          }
+          // Rehydrate all date fields in the entire persisted state
+          // The rehydrateDates function is recursive and handles nested objects/arrays
+          Object.keys(state).forEach(key => {
+            (state as any)[key] = rehydrateDates((state as any)[key]);
+          });
         }
       }
     }
